@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import threading
 import time
 
-st.set_page_config(page_title='Pre-Breakout Hunter V9.3', page_icon='🎯', layout='wide')
+st.set_page_config(page_title='Pre-Breakout Hunter V9.3.1', page_icon='🎯', layout='wide')
 
 MIN_BARS = 230
 DEFAULTS = {
@@ -678,7 +678,8 @@ def upstox_connection_test():
 
 
 
-# V9.3: NIFTY 500 -> Upstox instrument mapping + full-universe FULL stream with live 1-minute OHLCV.
+# V9.3.1: NIFTY 500 -> proven LTPC WebSocket + V3 REST 1-minute OHLC polling.
+# This hybrid avoids the FULL-feed WebSocket 403 seen on some Analytics-token sessions while preserving real-time LTPC streaming.
 # Read-only market data only. No order API is used.
 UPSTOX_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 UPSTOX_WS_STATE = {
@@ -686,6 +687,7 @@ UPSTOX_WS_STATE = {
     "error": "", "opened_at": None, "last_message_at": None,
     "updates": {}, "mapped": {}, "unmapped": [], "recovered": [], "universe_size": 0,
     "candles": {}, "last_day_volume": {},
+    "ohlc_thread": None, "ohlc_running": False, "ohlc_error": "", "ohlc_last_poll": None,
 }
 UPSTOX_WS_LOCK = threading.Lock()
 
@@ -913,13 +915,99 @@ def _update_candle_history(candles):
                 del series[:-120]
 
 
-def _start_upstox_nifty500_websocket(symbols):
-    """Start a V3 LTPC stream using Upstox's one-time authorized redirect URI.
 
-    The current Upstox V3 authorize endpoint returns a one-time wss:// URI.
-    Connecting to that URI directly avoids relying on the SDK's direct
-    handshake against /v3/feed/market-data-feed, which can return HTTP 403
-    when the server expects the authorized redirect flow.
+def _poll_upstox_i1_ohlc_loop(mapped):
+    """Poll Upstox V3 OHLC I1 for the entire 500-key universe.
+
+    Upstox V3 accepts up to 500 instrument keys in one OHLC request, so this
+    is intentionally one request per poll cycle rather than 500 requests.
+    The current and previous 1-minute candles are retained; repeated polls
+    update the current candle and append a new candle when its timestamp rolls.
+    """
+    try:
+        token = str(st.secrets.get("UPSTOX_ACCESS_TOKEN", "")).strip()
+    except Exception:
+        token = ""
+    keys = list(mapped.values())
+    reverse = {v: k for k, v in mapped.items()}
+    if not token or not keys:
+        return
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+    while True:
+        with UPSTOX_WS_LOCK:
+            if not UPSTOX_WS_STATE.get("ohlc_running"):
+                break
+        try:
+            params = {"instrument_key": ",".join(keys), "interval": "I1"}
+            r = requests.get("https://api.upstox.com/v3/market-quote/ohlc", headers=headers, params=params, timeout=20)
+            r.raise_for_status()
+            payload = r.json()
+            data = payload.get("data", {}) if isinstance(payload, dict) else {}
+            candles = {}
+            for api_key, item in data.items() if isinstance(data, dict) else []:
+                if not isinstance(item, dict):
+                    continue
+                ikey = str(item.get("instrument_token") or api_key.replace(":", "|"))
+                sym = reverse.get(ikey)
+                if not sym:
+                    continue
+                live = item.get("live_ohlc") or item.get("ohlc") or {}
+                prev = item.get("prev_ohlc") or {}
+                for candle in (prev, live):
+                    if not isinstance(candle, dict) or candle.get("ts") is None:
+                        continue
+                    candles[(sym, str(candle.get("ts")))] = {
+                        "Symbol": sym,
+                        "Instrument Key": ikey,
+                        "1m Timestamp": candle.get("ts"),
+                        "1m Open": candle.get("open"),
+                        "1m High": candle.get("high"),
+                        "1m Low": candle.get("low"),
+                        "1m Close": candle.get("close"),
+                        "1m Volume": candle.get("volume", candle.get("vol")),
+                    }
+            if candles:
+                _update_candle_history({f"{k[0]}::{k[1]}": v for k, v in candles.items()})
+                # _update_candle_history uses dict keys as symbols; normalize the histories.
+                with UPSTOX_WS_LOCK:
+                    hist = UPSTOX_WS_STATE.get("candles", {})
+                    for compound, c in list(hist.items()):
+                        if "::" not in str(compound):
+                            continue
+                        sym = str(compound).split("::", 1)[0]
+                        ts = c.get("1m Timestamp")
+                        target = hist.setdefault(sym, [])
+                        if not target or str(target[-1].get("1m Timestamp")) != str(ts):
+                            target.append(c)
+                        else:
+                            target[-1] = c
+                        if len(target) > 120:
+                            del target[:-120]
+                        del hist[compound]
+                    # expose the newest candle per stock in the live update table
+                    for sym, series in hist.items():
+                        if isinstance(series, list) and series:
+                            latest = series[-1]
+                            row = UPSTOX_WS_STATE["updates"].get(sym, {"Symbol": sym})
+                            row.update(latest)
+                            UPSTOX_WS_STATE["updates"][sym] = row
+                    UPSTOX_WS_STATE["ohlc_last_poll"] = datetime.now().strftime("%H:%M:%S")
+                    UPSTOX_WS_STATE["ohlc_error"] = ""
+        except Exception as exc:
+            with UPSTOX_WS_LOCK:
+                UPSTOX_WS_STATE["ohlc_error"] = f"I1 OHLC poll error: {type(exc).__name__}: {exc}"
+        time.sleep(15)
+
+
+def _start_upstox_nifty500_websocket(symbols):
+    """Start the proven V3 LTPC stream, then start V3 REST I1 polling.
+
+    V9.3.1 intentionally keeps the WebSocket on LTPC because the same
+    Analytics Token already proved stable for the 500-stock LTPC feed.
+    The richer I1 OHLCV data is obtained from the documented V3 OHLC REST
+    endpoint in one request for the 500 instruments. This avoids the FULL
+    WebSocket handshake 403 seen in some Analytics-token sessions while
+    retaining live streaming LTP data.
     """
     with UPSTOX_WS_LOCK:
         if UPSTOX_WS_STATE["running"]:
@@ -948,7 +1036,8 @@ def _start_upstox_nifty500_websocket(symbols):
     with UPSTOX_WS_LOCK:
         UPSTOX_WS_STATE.update({
             "running": True, "connected": False, "error": "", "opened_at": None,
-            "last_message_at": None, "updates": {}, "candles": {}, "last_day_volume": {}, "mapped": mapped,
+            "last_message_at": None, "updates": {}, "candles": {}, "last_day_volume": {},
+    "ohlc_thread": None, "ohlc_running": False, "ohlc_error": "", "ohlc_last_poll": None, "mapped": mapped,
             "unmapped": unmapped, "recovered": recovered, "universe_size": len(symbols),
         })
 
@@ -992,7 +1081,7 @@ def _start_upstox_nifty500_websocket(symbols):
                     request = {
                         "guid": str(uuid.uuid4()),
                         "method": "sub",
-                        "data": {"mode": "full", "instrumentKeys": chunk},
+                        "data": {"mode": "ltpc", "instrumentKeys": chunk},
                     }
                     sock.send(json.dumps(request).encode("utf-8"), opcode=websocket.ABNF.OPCODE_BINARY)
 
@@ -1045,11 +1134,15 @@ def _start_upstox_nifty500_websocket(symbols):
                 UPSTOX_WS_STATE["running"] = False
                 UPSTOX_WS_STATE["streamer"] = None
 
-    thread = threading.Thread(target=worker, name="upstox-v3-nifty500-authorized", daemon=True)
+    thread = threading.Thread(target=worker, name="upstox-v3-nifty500-ltpc", daemon=True)
+    ohlc_thread = threading.Thread(target=_poll_upstox_i1_ohlc_loop, args=(mapped,), name="upstox-v3-i1-ohlc", daemon=True)
     with UPSTOX_WS_LOCK:
         UPSTOX_WS_STATE["thread"] = thread
+        UPSTOX_WS_STATE["ohlc_thread"] = ohlc_thread
+        UPSTOX_WS_STATE["ohlc_running"] = True
     thread.start()
-    return True, f"started with {len(mapped)} mapped instruments"
+    ohlc_thread.start()
+    return True, f"started with {len(mapped)} mapped instruments + V3 I1 OHLC polling"
 
 def _stop_upstox_nifty500_websocket():
     with UPSTOX_WS_LOCK:
@@ -1061,6 +1154,7 @@ def _stop_upstox_nifty500_websocket():
             pass
     with UPSTOX_WS_LOCK:
         UPSTOX_WS_STATE["running"] = False
+        UPSTOX_WS_STATE["ohlc_running"] = False
         UPSTOX_WS_STATE["connected"] = False
 
 
@@ -1071,6 +1165,8 @@ if hasattr(st, "fragment"):
             connected = UPSTOX_WS_STATE["connected"]
             running = UPSTOX_WS_STATE["running"]
             error = UPSTOX_WS_STATE["error"]
+            ohlc_error = UPSTOX_WS_STATE.get("ohlc_error", "")
+            ohlc_last_poll = UPSTOX_WS_STATE.get("ohlc_last_poll")
             opened_at = UPSTOX_WS_STATE["opened_at"]
             last_message_at = UPSTOX_WS_STATE["last_message_at"]
             updates = dict(UPSTOX_WS_STATE["updates"])
@@ -1090,9 +1186,13 @@ if hasattr(st, "fragment"):
         c.metric("Updating", str(len(updates)))
         d.metric("Last Feed", last_message_at or "—")
         if opened_at:
-            st.caption(f"Connected at {opened_at} server time. Feed mode: FULL (read-only) • includes live 1-minute OHLCV.")
+            st.caption(f"Connected at {opened_at} server time. Feed mode: LTPC (read-only) • live LTP stream. 1-minute OHLCV is polled from Upstox V3 REST.")
         if error:
             st.error(f"WebSocket error: {error}")
+        if ohlc_last_poll:
+            st.caption(f"V3 I1 OHLC last poll: {ohlc_last_poll} • one 500-key REST request per cycle")
+        if ohlc_error:
+            st.warning(ohlc_error)
         if unmapped:
             st.warning(f"Unmapped NIFTY 500 symbols: {len(unmapped)} — {', '.join(unmapped[:20])}{' …' if len(unmapped)>20 else ''}")
         if recovered:
@@ -1110,7 +1210,7 @@ if hasattr(st, "fragment"):
             if ch:
                 cdf=pd.DataFrame(list(ch.values()))
                 st.markdown("### ⏱️ Live 1-Minute Candle Engine")
-                st.caption("The Upstox FULL feed supplies the current 1-minute OHLCV candle. The app keeps the latest 120 one-minute candles per stock in memory for the next intraday scanner stage.")
+                st.caption("Upstox V3 OHLC supplies the current and previous 1-minute OHLCV candle. The app polls all 500 keys in one request per cycle and keeps the latest 120 one-minute candles per stock in memory for the next intraday scanner stage.")
                 if not cdf.empty:
                     for col in ["1m Open","1m High","1m Low","1m Close","1m Volume"]:
                         if col in cdf: cdf[col]=pd.to_numeric(cdf[col],errors="coerce")
@@ -1124,7 +1224,7 @@ if hasattr(st, "fragment"):
 def upstox_nifty500_stream_test(symbols):
     st.markdown("## 🌐 Upstox NIFTY 500 Live Universe")
     st.caption(
-        "V9.3 uses the official NSE Indices NIFTY 500 constituent file first, then Upstox NSE_EQ mapping with instrument-search repair for valid equities. "
+        "V9.3.1 uses the official NSE Indices NIFTY 500 constituent file first, then Upstox NSE_EQ mapping with instrument-search repair for valid equities. "
         "Read-only — no order API is used."
     )
     c1,c2,c3 = st.columns(3)
@@ -1134,12 +1234,12 @@ def upstox_nifty500_stream_test(symbols):
         else: st.error(f"Could not start NIFTY 500 stream: {msg}")
     if c2.button("⏹️ STOP NIFTY 500", width="stretch"):
         _stop_upstox_nifty500_websocket(); st.toast("NIFTY 500 stream stopped")
-    c3.caption("Upstox V3 FULL limit is 2,000 keys per individual subscription; NIFTY 500 is well within that limit.")
+    c3.caption("WebSocket uses LTPC for stability; V3 OHLC REST supports up to 500 instrument keys per request.")
     render_upstox_nifty500_panel()
-    st.caption("This stage validates the current NIFTY 500 universe and streams live 1-minute OHLCV before we attach intraday data to the pre-breakout scoring engine.")
+    st.caption("This stage validates the NIFTY 500 universe, streams live LTPC over WebSocket, and polls current/previous 1-minute OHLCV from Upstox V3 REST before attaching intraday data to the pre-breakout scoring engine.")
 
 def main():
-    st.title('🎯 Pre-Breakout Hunter V9.3')
+    st.title('🎯 Pre-Breakout Hunter V9.3.1')
     upstox_connection_test()
     st.divider()
     # NIFTY 500 is loaded before the live-universe test so the exact scanner universe is used.
