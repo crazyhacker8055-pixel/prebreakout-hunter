@@ -1,15 +1,18 @@
-# Pre-Breakout Hunter V9.2
+# Pre-Breakout Hunter V9.2.1
 
-V9.2 adds a full NIFTY 500 Upstox live-universe test while retaining the V8.9 scanner and dashboards.
+V9.2.1 hardens the NIFTY 500 live-universe mapping before live data is connected to the pre-breakout engine.
 
-## Upstox V9.2
-- Uses the read-only `UPSTOX_ACCESS_TOKEN` stored in Streamlit Secrets.
-- Downloads the current Upstox NSE instrument master and maps NIFTY 500 trading symbols to `NSE_EQ` instrument keys.
-- Streams the mapped universe through Upstox Market Data Feed V3 in `ltpc` mode.
-- Displays mapped/unmapped counts, updating instruments, latest feed time, LTP, previous close, change %, last quantity and trade time.
+## What changed
+- Uses the official NSE Indices NIFTY 500 constituent CSV as the primary universe source.
+- Keeps public mirrors only as fallbacks if the official download is temporarily unavailable.
+- Filters obvious `DUMMY*` index-calculation placeholders so they cannot consume live WebSocket slots or become scanner candidates.
+- Uses the Upstox NSE BOD instrument master for exact `NSE_EQ` mapping.
+- If a valid equity is temporarily missing from the downloaded BOD file, the app uses Upstox Instrument Search as a per-symbol repair path.
+- Displays repaired symbols separately from genuinely unmapped symbols.
+- Keeps the read-only LTPC WebSocket architecture from V9.2.
 - No order/trading API is used.
 
-Upstox documents a 5,000-instrument individual LTPC subscription limit, so the NIFTY 500 universe is within the documented limit.
+NSE Indices publishes the NIFTY 500 constituent file, and Upstox recommends the unique `instrument_key` from its instrument data for market-data APIs. Upstox's V3 LTPC feed currently allows up to 5,000 instrument keys per individual subscription, so the NIFTY 500 universe is within the documented limit.
 
 ## Deploy
 Replace `app.py` and `requirements.txt` in the existing GitHub `main` branch. Keep the existing Streamlit Secret:
