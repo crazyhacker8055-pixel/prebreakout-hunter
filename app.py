@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import threading
 import time
 
-st.set_page_config(page_title='Pre-Breakout Hunter V9.2.1', page_icon='🎯', layout='wide')
+st.set_page_config(page_title='Pre-Breakout Hunter V9.3', page_icon='🎯', layout='wide')
 
 MIN_BARS = 230
 DEFAULTS = {
@@ -678,13 +678,14 @@ def upstox_connection_test():
 
 
 
-# V9.2: NIFTY 500 -> Upstox instrument mapping + full-universe LTPC stream.
+# V9.3: NIFTY 500 -> Upstox instrument mapping + full-universe FULL stream with live 1-minute OHLCV.
 # Read-only market data only. No order API is used.
 UPSTOX_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 UPSTOX_WS_STATE = {
     "streamer": None, "thread": None, "running": False, "connected": False,
     "error": "", "opened_at": None, "last_message_at": None,
     "updates": {}, "mapped": {}, "unmapped": [], "recovered": [], "universe_size": 0,
+    "candles": {}, "last_day_volume": {},
 }
 UPSTOX_WS_LOCK = threading.Lock()
 
@@ -820,12 +821,36 @@ def _find_ltpc(obj):
     return None
 
 
+def _find_first_key(obj, wanted):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if str(k) == wanted:
+                return v
+            found = _find_first_key(v, wanted)
+            if found is not None:
+                return found
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            found = _find_first_key(v, wanted)
+            if found is not None:
+                return found
+    return None
+
+
+def _extract_market_ohlc(obj):
+    return _find_first_key(obj, "marketOhlc") or _find_first_key(obj, "marketOHLC")
+
+
+def _extract_efeed(obj):
+    return _find_first_key(obj, "eFeedDetails") or _find_first_key(obj, "eFeedDetails")
+
+
 def _extract_live_updates(message, reverse):
     payload = _as_dict(message)
     feeds = payload.get("feeds", {}) if isinstance(payload, dict) else {}
     if not isinstance(feeds, dict):
-        return {}
-    out = {}
+        return {}, {}
+    out, candles = {}, {}
     for instrument_key, feed in feeds.items():
         name = reverse.get(instrument_key, instrument_key)
         ltpc = _find_ltpc(feed)
@@ -838,12 +863,54 @@ def _extract_live_updates(message, reverse):
                 change_pct = (float(ltp) / float(cp) - 1.0) * 100.0
         except Exception:
             pass
-        out[name] = {
+        row = {
             "Symbol": name, "Instrument Key": instrument_key, "LTP": ltp,
             "Prev Close": cp, "Change %": change_pct, "Last Qty": ltpc.get("ltq"),
             "Trade Time": ltpc.get("ltt"), "Received": datetime.now().strftime("%H:%M:%S"),
         }
-    return out
+        ef = _extract_efeed(feed)
+        if isinstance(ef, dict):
+            row["Day Volume"] = ef.get("vtt") or ef.get("volume")
+            row["ATP"] = ef.get("atp")
+        mo = _extract_market_ohlc(feed)
+        arr = mo.get("ohlc", []) if isinstance(mo, dict) else []
+        if isinstance(arr, list):
+            for item in arr:
+                if not isinstance(item, dict):
+                    continue
+                interval = item.get("interval")
+                if interval == "I1":
+                    c = {
+                        "Symbol": name, "Instrument Key": instrument_key,
+                        "1m Timestamp": item.get("ts"), "1m Open": item.get("open"),
+                        "1m High": item.get("high"), "1m Low": item.get("low"),
+                        "1m Close": item.get("close"), "1m Volume": item.get("vol"),
+                    }
+                    candles[name] = c
+                    row.update(c)
+                elif interval == "I30":
+                    row["30m Close"] = item.get("close")
+        out[name] = row
+    return out, candles
+
+
+def _update_candle_history(candles):
+    if not candles:
+        return
+    with UPSTOX_WS_LOCK:
+        hist = UPSTOX_WS_STATE.setdefault("candles", {})
+        for symbol, c in candles.items():
+            ts = c.get("1m Timestamp")
+            if ts is None:
+                continue
+            series = hist.setdefault(symbol, [])
+            clean = dict(c)
+            if series and str(series[-1].get("1m Timestamp")) == str(ts):
+                series[-1] = clean
+            else:
+                series.append(clean)
+            if len(series) > 120:
+                del series[:-120]
 
 
 def _start_upstox_nifty500_websocket(symbols):
@@ -881,7 +948,7 @@ def _start_upstox_nifty500_websocket(symbols):
     with UPSTOX_WS_LOCK:
         UPSTOX_WS_STATE.update({
             "running": True, "connected": False, "error": "", "opened_at": None,
-            "last_message_at": None, "updates": {}, "mapped": mapped,
+            "last_message_at": None, "updates": {}, "candles": {}, "last_day_volume": {}, "mapped": mapped,
             "unmapped": unmapped, "recovered": recovered, "universe_size": len(symbols),
         })
 
@@ -925,7 +992,7 @@ def _start_upstox_nifty500_websocket(symbols):
                     request = {
                         "guid": str(uuid.uuid4()),
                         "method": "sub",
-                        "data": {"mode": "ltpc", "instrumentKeys": chunk},
+                        "data": {"mode": "full", "instrumentKeys": chunk},
                     }
                     sock.send(json.dumps(request).encode("utf-8"), opcode=websocket.ABNF.OPCODE_BINARY)
 
@@ -935,11 +1002,12 @@ def _start_upstox_nifty500_websocket(symbols):
                         return
                     decoded = MarketDataFeedV3_pb2.FeedResponse.FromString(message)
                     payload = json_format.MessageToDict(decoded)
-                    updates = _extract_live_updates(payload, reverse)
+                    updates, candles = _extract_live_updates(payload, reverse)
                     with UPSTOX_WS_LOCK:
                         UPSTOX_WS_STATE["last_message_at"] = datetime.now().strftime("%H:%M:%S")
                         if updates:
                             UPSTOX_WS_STATE["updates"].update(updates)
+                    _update_candle_history(candles)
                 except Exception as exc:
                     with UPSTOX_WS_LOCK:
                         UPSTOX_WS_STATE["error"] = f"Feed decode error: {type(exc).__name__}: {exc}"
@@ -1022,7 +1090,7 @@ if hasattr(st, "fragment"):
         c.metric("Updating", str(len(updates)))
         d.metric("Last Feed", last_message_at or "—")
         if opened_at:
-            st.caption(f"Connected at {opened_at} server time. Feed mode: LTPC (read-only).")
+            st.caption(f"Connected at {opened_at} server time. Feed mode: FULL (read-only) • includes live 1-minute OHLCV.")
         if error:
             st.error(f"WebSocket error: {error}")
         if unmapped:
@@ -1034,8 +1102,21 @@ if hasattr(st, "fragment"):
             df=pd.DataFrame(rows)
             if "Change %" in df:
                 df["Change %"]=pd.to_numeric(df["Change %"],errors="coerce").round(2)
+            preferred=[c for c in ["Symbol","LTP","Prev Close","Change %","Day Volume","ATP","1m Open","1m High","1m Low","1m Close","1m Volume","1m Timestamp","Last Qty","Received"] if c in df.columns]
             df=df.sort_values("Change %",ascending=False,na_position="last")
-            st.dataframe(df, use_container_width=True, hide_index=True, height=560)
+            st.dataframe(df[preferred], use_container_width=True, hide_index=True, height=560)
+            with UPSTOX_WS_LOCK:
+                ch=dict(UPSTOX_WS_STATE.get("candles", {}))
+            if ch:
+                cdf=pd.DataFrame(list(ch.values()))
+                st.markdown("### ⏱️ Live 1-Minute Candle Engine")
+                st.caption("The Upstox FULL feed supplies the current 1-minute OHLCV candle. The app keeps the latest 120 one-minute candles per stock in memory for the next intraday scanner stage.")
+                if not cdf.empty:
+                    for col in ["1m Open","1m High","1m Low","1m Close","1m Volume"]:
+                        if col in cdf: cdf[col]=pd.to_numeric(cdf[col],errors="coerce")
+                    cdf["1m Range %"]=(cdf["1m High"]-cdf["1m Low"])/cdf["1m Open"].replace(0,np.nan)*100
+                    cdf=cdf.sort_values("1m Volume",ascending=False,na_position="last")
+                    st.dataframe(cdf[[c for c in ["Symbol","1m Timestamp","1m Open","1m High","1m Low","1m Close","1m Volume","1m Range %"] if c in cdf.columns]].head(30), use_container_width=True, hide_index=True, height=420)
         else:
             st.caption("Waiting for the first NIFTY 500 market-data snapshot…")
 
@@ -1043,7 +1124,7 @@ if hasattr(st, "fragment"):
 def upstox_nifty500_stream_test(symbols):
     st.markdown("## 🌐 Upstox NIFTY 500 Live Universe")
     st.caption(
-        "V9.2.1 uses the official NSE Indices NIFTY 500 constituent file first, then Upstox NSE_EQ mapping with instrument-search repair for valid equities. "
+        "V9.3 uses the official NSE Indices NIFTY 500 constituent file first, then Upstox NSE_EQ mapping with instrument-search repair for valid equities. "
         "Read-only — no order API is used."
     )
     c1,c2,c3 = st.columns(3)
@@ -1053,12 +1134,12 @@ def upstox_nifty500_stream_test(symbols):
         else: st.error(f"Could not start NIFTY 500 stream: {msg}")
     if c2.button("⏹️ STOP NIFTY 500", width="stretch"):
         _stop_upstox_nifty500_websocket(); st.toast("NIFTY 500 stream stopped")
-    c3.caption("Upstox V3 LTPC limit is 5,000 keys per individual subscription; NIFTY 500 is well within that limit.")
+    c3.caption("Upstox V3 FULL limit is 2,000 keys per individual subscription; NIFTY 500 is well within that limit.")
     render_upstox_nifty500_panel()
-    st.caption("This stage validates the current NIFTY 500 universe and full-universe streaming before we attach live data to the pre-breakout scoring engine.")
+    st.caption("This stage validates the current NIFTY 500 universe and streams live 1-minute OHLCV before we attach intraday data to the pre-breakout scoring engine.")
 
 def main():
-    st.title('🎯 Pre-Breakout Hunter V9.2.1')
+    st.title('🎯 Pre-Breakout Hunter V9.3')
     upstox_connection_test()
     st.divider()
     # NIFTY 500 is loaded before the live-universe test so the exact scanner universe is used.
