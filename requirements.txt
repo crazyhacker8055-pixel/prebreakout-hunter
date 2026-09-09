@@ -1,8 +1,0 @@
-streamlit>=1.45,<2
-pandas>=2.2,<3
-numpy>=1.26,<3
-yfinance>=0.2.54,<1
-lxml>=5,<7
-requests>=2.32,<3
-
-upstox-python-sdk>=2.19,<3
