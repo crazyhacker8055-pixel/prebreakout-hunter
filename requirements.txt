@@ -1,0 +1,7 @@
+streamlit
+pandas
+numpy
+yfinance
+lxml
+requests
+upstox-python-sdk>=2.19,<3
