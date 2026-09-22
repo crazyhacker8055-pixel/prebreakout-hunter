@@ -8,9 +8,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
-st.set_page_config(page_title="Pre-Breakout Hunter V29", page_icon="🎯", layout="wide")
+st.set_page_config(page_title="Pre-Breakout Hunter V31", page_icon="🎯", layout="wide")
 
-APP_VERSION = "V29.0 FINAL — STRICT + SMART LIVE RADAR + ROBUST LIVE DATA + FAST REFRESH"
+APP_VERSION = "V31.0 FINAL — STRICT + LIVE EVENT RADAR + PERSISTENT CONTINUITY"
 IST = ZoneInfo("Asia/Kolkata")
 MIN_BARS = 230
 HISTORY_CAL_DAYS = 390
@@ -982,6 +982,7 @@ def perform_live_refresh(state, mapping, cfg):
         if not ready.empty: ready=ready.merge(bt,on="Stock",how="left")
         if not near.empty: near=near.merge(bt,on="Stock",how="left")
         if not triggered.empty: triggered=triggered.merge(bt,on="Stock",how="left")
+        if not event_df.empty: event_df=event_df.merge(bt,on="Stock",how="left",suffixes=("","_BT"))
     ready=add_live_priority(ready); near=add_live_priority(near); triggered=add_live_priority(triggered)
     ready=add_trade_plan(ready,frames); near=add_trade_plan(near,frames); triggered=add_trade_plan(triggered,frames)
     for df in (ready,near,triggered):
@@ -1030,10 +1031,60 @@ def render_event_radar(event):
             a,b=st.columns(2); a.metric("RANGE / 20D",f"{float(r['Live Range / 20D Avg']):.2f}x"); b.metric("VOL / 20D",f"{float(r['Live Volume / 20D Avg']):.2f}x")
             st.caption(f"Why: {r.get('Event Reason','—')}")
             st.caption(f"Market state: {'OPEN / LIVE' if (9*60+15) <= (now_ist().hour*60+now_ist().minute) <= (15*60+35) and now_ist().weekday()<5 else 'CLOSED / FINAL SESSION DATA'}")
-            st.caption(f"Structure score: {int(r.get('Score',0))}/100 • Live pressure: {int(r.get('Live Breakout Pressure',0))}/100 • 1m high: ₹{float(r.get('Minute High',np.nan)):.2f} if available")
+            hist=f" • Hist. success: {float(r['Validated success %']):.1f}% ({int(r.get('Occurrences',0))} events)" if pd.notna(r.get('Validated success %',np.nan)) else ""
+            st.caption(f"Structure score: {int(r.get('Score',0))}/100 • Live pressure: {int(r.get('Live Breakout Pressure',0))}/100{hist}")
     cols=[c for c in ["Stock","Event Status","Event Quality Score","LTP","Pivot","Live To Pivot %","Live High","Live Position %","Live Range / 20D Avg","Live Volume / 20D Avg","Score","Live Breakout Pressure"] if c in event.columns]
     st.dataframe(event[cols].head(20).reset_index(drop=True),width="stretch",hide_index=True)
 
+
+def _event_snapshot(event_df, observed_at):
+    if event_df is None or event_df.empty:
+        return pd.DataFrame()
+    keep=[c for c in ["Stock","Event Status","Event Quality Score","LTP","Pivot","Live To Pivot %","Live High","Live Position %","Live Range / 20D Avg","Live Volume / 20D Avg","Score","Validated success %","Occurrences"] if c in event_df.columns]
+    snap=event_df[keep].copy()
+    snap["Observed At"]=observed_at
+    return snap
+
+def _append_event_history(history, event_df, observed_at, max_rows=200):
+    old=history.copy() if isinstance(history,pd.DataFrame) else pd.DataFrame()
+    new=_event_snapshot(event_df,observed_at)
+    if new.empty: return old
+    out=pd.concat([old,new],ignore_index=True) if not old.empty else new
+    out["Stock"]=out["Stock"].astype(str).str.upper()
+    out=out.sort_values("Observed At").drop_duplicates(["Stock","Observed At"],keep="last").tail(max_rows).reset_index(drop=True)
+    return out
+
+def _strict_snapshot(ready,near,triggered,observed_at):
+    frames=[]
+    for label,df in (("READY NOW",ready),("NEAR-MISS NOW",near),("STRICT BREAKOUT",triggered)):
+        if df is None or df.empty: continue
+        x=df.copy()
+        x["Snapshot Stage"]=label
+        x["Observed At"]=observed_at
+        frames.append(x)
+    return pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
+
+def render_continuity(state, current_event, current_strict):
+    # Show previously observed signals instead of letting them disappear silently.
+    hist=state.get("event_history",pd.DataFrame())
+    cur_syms=set(current_event.Stock.astype(str).str.upper()) if current_event is not None and not current_event.empty else set()
+    if isinstance(hist,pd.DataFrame) and not hist.empty:
+        old=hist[~hist.Stock.astype(str).str.upper().isin(cur_syms)].copy()
+        if not old.empty:
+            with st.expander("🕘 Recent live events — no longer active",expanded=False):
+                st.caption("These were genuinely detected by the live radar on an earlier refresh. They are retained for continuity only and are NOT current signals.")
+                show=[c for c in ["Stock","Event Status","Event Quality Score","LTP","Pivot","Live To Pivot %","Live Position %","Live Range / 20D Avg","Live Volume / 20D Avg","Validated success %","Occurrences","Observed At"] if c in old.columns]
+                latest=old.sort_values("Observed At",ascending=False).drop_duplicates("Stock",keep="first")
+                st.dataframe(latest[show].head(30),width="stretch",hide_index=True)
+    full_strict=state.get("full_scan_strict",pd.DataFrame())
+    cur_strict_syms=set(current_strict.Stock.astype(str).str.upper()) if current_strict is not None and not current_strict.empty else set()
+    if isinstance(full_strict,pd.DataFrame) and not full_strict.empty:
+        old=full_strict[~full_strict.Stock.astype(str).str.upper().isin(cur_strict_syms)].copy()
+        if not old.empty:
+            with st.expander("🕘 Full-scan strict candidates — not current now",expanded=False):
+                st.caption("These passed READY/NEAR-MISS/STRICT BREAKOUT during the last full scan. They are retained for comparison; Live Refresh does not promote them back into current lists.")
+                show=[c for c in ["Stock","Snapshot Stage","Live Status","Score","LTP","Live To Pivot %","Live Breakout Pressure","Historical Adjusted Success %","Validated success %","Occurrences","Observed At"] if c in old.columns]
+                st.dataframe(old[show].head(30),width="stretch",hide_index=True)
 
 def render_chart(state, dfs):
     chart_df=next((x for x in dfs if not x.empty),pd.DataFrame())
@@ -1102,9 +1153,13 @@ def main():
             try:
                 with st.spinner("Refreshing live Upstox 1D + 1-minute data…"):
                     new_state=perform_live_refresh(state,mapping,cfg)
+                refresh_time=new_state.get("run_time",now_ist())
                 old_event=state.get("event",pd.DataFrame()).copy()
                 new_state["previous_full_scan_event"]=state.get("full_scan_event",old_event).copy()
                 new_state["previous_full_scan_time"]=state.get("full_scan_time",state.get("run_time"))
+                new_state["event_history"]=_append_event_history(state.get("event_history",pd.DataFrame()),new_state.get("event",pd.DataFrame()),refresh_time)
+                if "full_scan_strict" not in new_state:
+                    new_state["full_scan_strict"]=_strict_snapshot(state.get("ready",pd.DataFrame()),state.get("near",pd.DataFrame()),state.get("triggered",pd.DataFrame()),state.get("full_scan_time",refresh_time))
                 st.session_state.v27=new_state
                 st.success("Live refresh complete — reused the exact full-scan structure; no 500-stock historical download was performed.")
             except Exception as e:
@@ -1159,6 +1214,10 @@ def main():
                 names=[]
                 for df in (triggered,ready,near):
                     if not df.empty: names.extend(df.Stock.astype(str).str.upper().tolist())
+                # Event Radar candidates are validated too, but remain separate
+                # from the strict scanner. Cap the candidate set to keep the
+                # full scan responsive.
+                if not event_df.empty: names.extend(event_df.Stock.astype(str).str.upper().tolist())
                 names=list(dict.fromkeys(names))[:30]
                 bt=backtest_candidates(names,mapping,nifty,cfg)
                 for df in (triggered,ready,near):
@@ -1168,12 +1227,18 @@ def main():
                     if not ready.empty: ready=ready.merge(bt,on="Stock",how="left")
                     if not near.empty: near=near.merge(bt,on="Stock",how="left")
                     if not triggered.empty: triggered=triggered.merge(bt,on="Stock",how="left")
+                    if not event_df.empty: event_df=event_df.merge(bt,on="Stock",how="left",suffixes=("","_BT"))
                 ready=add_live_priority(ready); near=add_live_priority(near); triggered=add_live_priority(triggered)
                 ready=add_trade_plan(ready,frames); near=add_trade_plan(near,frames); triggered=add_trade_plan(triggered,frames)
                 for df in (ready,near,triggered):
                     if not df.empty:
                         df["Risk Status"]=np.where(df["Risk %"].fillna(999)<=10,"OK","HIGH RISK"); df["Action"]=np.where(df["Risk %"].fillna(999)<=10,"ACTIONABLE PLAN","WATCH ONLY — RISK > 10%")
-                st.session_state.v27=dict(ready=ready,near=near,triggered=triggered,event=event_df,full_scan_event=event_df.copy(),pool_df=pool_df.copy(),frames=frames,errors=errors,live_errors=day_errors+minute_errors,nifty=nifty,mapping=mapping,start=start,end=end,asof=asof,cfg=cfg,run_time=now_ist(),full_scan_time=now_ist(),live_map=live_map)
+                scan_time=now_ist()
+                strict_snapshot=_strict_snapshot(ready,near,triggered,scan_time)
+                event_history=_append_event_history(pd.DataFrame(),event_df,scan_time)
+                st.session_state.v27=dict(ready=ready,near=near,triggered=triggered,event=event_df,full_scan_event=event_df.copy(),full_scan_strict=strict_snapshot,
+                    event_history=event_history,pool_df=pool_df.copy(),frames=frames,errors=errors,live_errors=day_errors+minute_errors,
+                    nifty=nifty,mapping=mapping,start=start,end=end,asof=asof,cfg=cfg,run_time=scan_time,full_scan_time=scan_time,live_map=live_map)
                 st.session_state.v27_job=None
                 status.update(label="Full scan complete",state="complete")
                 st.rerun()
@@ -1191,7 +1256,7 @@ def main():
     tabs=st.tabs(["🎯 STRICT SCANNER","🚨 LIVE EVENT RADAR","📊 FORMATION CHART"])
     with tabs[0]:
         st.subheader("🎯 STRICT PRE-BREAKOUT SCANNER")
-        a,b,c,d=st.columns(4); a.metric("LIVE BREAKOUT",len(triggered)); b.metric("READY NOW",len(ready)); c.metric("NEAR-MISS",len(near)); d.metric("BACKTESTED",min(30,len(pd.concat([ready,near,triggered],ignore_index=True))))
+        a,b,c,d=st.columns(4); a.metric("STRICT BREAKOUT",len(triggered)); b.metric("READY NOW",len(ready)); c.metric("NEAR-MISS",len(near)); d.metric("BACKTESTED",min(30,len(pd.concat([ready,near,triggered],ignore_index=True))))
         ev=state.get("event",pd.DataFrame())
         ev_counts=ev.get("Event Status",pd.Series(dtype=str)).value_counts() if not ev.empty else pd.Series(dtype=int)
         st.caption(f"History: {len(state['frames'])}/{len(state['mapping'])} mapped usable • live refresh: {state['run_time'].strftime('%Y-%m-%d %H:%M:%S %Z')}")
@@ -1207,15 +1272,8 @@ def main():
 
     with tabs[1]:
         render_event_radar(event)
-        prev=state.get("previous_full_scan_event",pd.DataFrame())
-        if not prev.empty:
-            current_syms=set(event.Stock.astype(str).str.upper()) if not event.empty else set()
-            old=prev[~prev.Stock.astype(str).str.upper().isin(current_syms)].copy()
-            if not old.empty:
-                with st.expander("🕘 Previous full-scan events — no longer active after refresh",expanded=False):
-                    st.caption("These stocks appeared in the last RUN FULL SCANNER. They are shown for continuity only; they are NOT current live signals.")
-                    show=[c for c in ["Stock","Event Status","Event Quality Score","LTP","Pivot","Live To Pivot %","Live Position %","Live Range / 20D Avg","Live Volume / 20D Avg"] if c in old.columns]
-                    st.dataframe(old[show].head(30),width="stretch",hide_index=True)
+        current_strict=pd.concat([triggered,ready,near],ignore_index=True) if any(not x.empty for x in (triggered,ready,near)) else pd.DataFrame()
+        render_continuity(state,event,current_strict)
         if not event.empty:
             render_chart(state,[event])
 
@@ -1241,7 +1299,7 @@ def main():
 
 **FAST REFRESH:** once today's completed history is cached, ⚡ LIVE REFRESH makes only fresh live-market requests and recalculates the strict/event tabs. It does not re-download 500 daily histories.
 """)
-    st.caption("Pre-Breakout Hunter V30 • Strict scanner + separate Live Event Radar + Fast Live Refresh • Upstox V3 • no Yahoo • no order API")
+    st.caption("Pre-Breakout Hunter V31 • Strict scanner + separate Live Event Radar + Fast Live Refresh • Upstox V3 • no Yahoo • no order API")
 
 
 if __name__=="__main__":
